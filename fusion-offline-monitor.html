@@ -226,10 +226,12 @@ button{font-family:var(--sans);}
 .node-col{display:flex; flex-direction:column; align-items:flex-start; position:relative;}
 .node{
   width:150px; border:1px solid var(--line); border-radius:10px; background:var(--panel-2);
-  padding:10px 12px; cursor:pointer; position:relative; transition:border-color .15s, transform .1s, box-shadow .15s;
+  padding:10px 12px; cursor:default; position:relative; transition:border-color .15s, transform .1s, box-shadow .15s;
   z-index:2; box-shadow:var(--shadow-card);
 }
-.node:hover{border-color:var(--signal); transform:translateY(-1px); box-shadow:0 2px 4px rgba(15,23,42,0.08), 0 12px 28px -10px var(--signal-glow, rgba(77,232,212,0.25));}
+.node.has-children{cursor:pointer;}
+.node.has-children:hover{border-color:var(--signal); transform:translateY(-1px); box-shadow:0 2px 4px rgba(15,23,42,0.08), 0 12px 28px -10px var(--signal-glow, rgba(77,232,212,0.25));}
+.node.has-children:focus-visible{outline:none; border-color:var(--signal); box-shadow:0 0 0 3px var(--signal-dim);}
 .node.selected{border-color:var(--signal); box-shadow:0 0 0 1px var(--signal), 0 8px 22px -8px rgba(77,232,212,0.4);}
 .node.pending{opacity:0.55;}
 .node-top{display:flex; align-items:center; gap:8px;}
@@ -896,7 +898,7 @@ function renderTxnStrip(){
 /* ----------------------- Rendering: flow diagram ----------------------- */
 function compStyle(name){ return COMPONENT_STYLE[name] || COMPONENT_STYLE.Default; }
 
-function nodeHtml(stepId){
+function nodeHtml(stepId, hasChildren){
   const audit = stepAudit(stepId);
   const info = getStepDisplayInfo(stepId);
   const style = compStyle(info.componentName);
@@ -908,8 +910,13 @@ function nodeHtml(stepId){
     idle:'<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" fill="#1a1f2b"/></svg>',
   }[statusCls];
   const timeLbl = audit.startMs ? fmtTs(audit.startMs).split(' ')[1] : (audit.status==='PENDING' ? 'not run' : '—');
+  // Only nodes with real sub-components are clickable in the diagram — clicking
+  // toggles inline expansion. Leaf nodes render with no click affordance; the
+  // diagram never opens the drawer (that's the table's job alone).
+  const clickAttrs = hasChildren ? `data-toggle-fork="${stepId}" tabindex="0"` : '';
+  const clickCls = hasChildren ? 'has-children' : 'leaf';
   return `
-  <div class="node ${audit.status==='PENDING'?'pending':''}" data-step="${stepId}" tabindex="0">
+  <div class="node ${clickCls} ${audit.status==='PENDING'?'pending':''}" data-step="${stepId}" ${clickAttrs}>
     <div class="node-status ${statusCls}">${icon}</div>
     <div class="node-top">
       <div class="badge" style="background:${style.bg}">${style.code}</div>
@@ -949,7 +956,7 @@ const MAX_DIAGRAM_DEPTH = 12; // safety cap; real flows never get remotely this 
 
 function nodeColHtml(stepId, depth){
   const children = depth < MAX_DIAGRAM_DEPTH ? diagramChildren(stepId) : null;
-  let html = nodeHtml(stepId);
+  let html = nodeHtml(stepId, !!children);
   if (children){
     const expanded = EXPANDED_FORKS.has(stepId);
     const count = children.type === 'routes' ? children.routes.length : children.stepIds.length;
@@ -997,12 +1004,16 @@ function renderFlow(){
   // Diagram nodes only ever toggle inline expansion — they never open the
   // drawer. The Step Audit Trail table is the sole place for inspecting a
   // step's input/output payloads.
-  $$('[data-toggle-fork]', wrap).forEach(btn => btn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    const id = btn.dataset.toggleFork;
+  const toggle = (id) => {
     if (EXPANDED_FORKS.has(id)) EXPANDED_FORKS.delete(id); else EXPANDED_FORKS.add(id);
     renderFlow();
-  }));
+  };
+  $$('[data-toggle-fork]', wrap).forEach(el => {
+    el.addEventListener('click', (e) => { e.stopPropagation(); toggle(el.dataset.toggleFork); });
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); e.stopPropagation(); toggle(el.dataset.toggleFork); }
+    });
+  });
 }
 
 /* ----------------------- Rendering: table ----------------------- */
