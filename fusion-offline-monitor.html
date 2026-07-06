@@ -311,6 +311,20 @@ tbody tr.selected{background:var(--signal-dim);}
 tbody td{padding:11px 16px; vertical-align:middle;}
 .td-step .stepname{font-weight:600; font-size:12.5px;}
 .td-step .comp{font-size:10.5px; color:var(--text-faint); font-family:var(--mono); margin-top:2px;}
+.td-step-inner{display:flex; align-items:flex-start; gap:9px;}
+.td-step-text{min-width:0;}
+.row-toggle{
+  width:18px; height:18px; border-radius:5px; border:1px solid var(--line); background:var(--panel-2);
+  color:var(--text-faint); display:flex; align-items:center; justify-content:center; cursor:pointer;
+  flex-shrink:0; margin-top:1px; transition:border-color .15s, color .15s, background .15s;
+}
+.row-toggle:hover{border-color:var(--signal); color:var(--signal); background:var(--panel-3);}
+.row-toggle svg{width:9px;height:9px;}
+.row-toggle-spacer{width:18px; flex-shrink:0;}
+tr.route-row{background:rgba(77,232,212,0.03);}
+tr.route-row:hover{background:var(--panel-2);}
+.route-label{color:var(--text-dim); font-style:italic;}
+.route-count{color:var(--text-faint); font-weight:500; font-family:var(--mono); font-size:11px;}
 .td-time{font-family:var(--mono); color:var(--text-dim); white-space:nowrap;}
 .td-iter{font-family:var(--mono); color:var(--text-dim);}
 .chev{color:var(--text-faint); text-align:right;}
@@ -530,16 +544,28 @@ const COMPONENT_STYLE = {
   SQL:         { code:'DB',   bg:'#3ecf8e' },
   AmazonS3:    { code:'S3',   bg:'#ff9d5c' },
   Expression:  { code:'EXPR', bg:'#8b98a9' },
+  APIServer:   { code:'API',  bg:'#4de8d4' },
+  Operations:  { code:'OPS',  bg:'#7fb8ff' },
+  Service:     { code:'SVC',  bg:'#5ee6ff' },
+  IfElse:      { code:'IF',   bg:'#f5a623' },
+  TryCatch:    { code:'TRY',  bg:'#ff9d5c' },
+  Try:         { code:'TRY',  bg:'#ffc48a' },
+  Catch:       { code:'CAT',  bg:'#ff8a8a' },
+  Finally:     { code:'FIN',  bg:'#b98af0' },
+  Status:      { code:'STA',  bg:'#3ecf8e' },
+  OpenAPIClient:{ code:'API', bg:'#5ee6ff' },
   Default:     { code:'CMP',  bg:'#8b98a9' },
 };
 
 let ZIP = null;
 let ZIP_PREFIX = '';       // path prefix before "event/..." if the bundle is nested in a folder
-let STEP_INDEX = [];       // flattened list of top-level steps (in order)
+let STEP_INDEX = [];       // flattened list of top-level steps (in order), from componentStructure
 let RECORDS_BY_STEP = {};  // stepId -> sorted audit records
 let PAYLOAD_CACHE = {};    // "folder/file" -> parsed payload (or {__raw:string})
 let TXN_META = {};         // summary info about the transaction
 let CURRENT_STEP = null;
+let NODE_INFO = {};          // stepId -> {displayName, componentName, actionName, stepName, parentConfigId} (metadata-driven)
+let CHILDREN_BY_PARENT = {}; // parentConfigId ('' for root) -> [stepId,...] in chronological order (metadata-driven)
 
 /* ----------------------- DOM refs ----------------------- */
 const $ = (sel, root=document) => root.querySelector(sel);
@@ -658,6 +684,35 @@ async function parseBundle(){
   }
   for (const sid of Object.keys(RECORDS_BY_STEP)){
     RECORDS_BY_STEP[sid].sort((a,b) => a._seq - b._seq);
+  }
+
+  // Build a generic runtime step tree straight from the audit records themselves.
+  // This is the only reliable source for dynamically-discovered sub-flows (e.g. a
+  // Service/Operations component's internals never appear in componentStructure at all).
+  NODE_INFO = {};
+  CHILDREN_BY_PARENT = {};
+  for (const sid of Object.keys(RECORDS_BY_STEP)){
+    const recs = RECORDS_BY_STEP[sid];
+    const withStepName = recs.find(r => r.stepName) || recs[0];
+    const withParent = recs.find(r => r.parentConfigId !== undefined) || recs[0];
+    NODE_INFO[sid] = {
+      displayName: withStepName.displayName || withStepName.componentName || 'Step',
+      componentName: withStepName.componentName || 'Default',
+      actionName: withStepName.actionName || null,
+      stepName: recs.find(r => r.stepName)?.stepName || null,
+      parentConfigId: withParent.parentConfigId || '',
+    };
+  }
+  for (const sid of Object.keys(NODE_INFO)){
+    const parentKey = NODE_INFO[sid].parentConfigId || '';
+    (CHILDREN_BY_PARENT[parentKey] = CHILDREN_BY_PARENT[parentKey] || []).push(sid);
+  }
+  for (const key of Object.keys(CHILDREN_BY_PARENT)){
+    CHILDREN_BY_PARENT[key].sort((a,b) => {
+      const aStart = stepAudit(a).startMs ?? Infinity;
+      const bStart = stepAudit(b).startMs ?? Infinity;
+      return aStart - bStart;
+    });
   }
 
   STEP_INDEX = structure.map(buildStepNode);
@@ -788,19 +843,6 @@ async function resolvePayload(payloadKey){
   return parsed;
 }
 
-/* ----------------------- Flatten for table iteration ----------------------- */
-function walkAll(nodes, depth, cb){
-  for (const n of nodes){
-    cb(n, depth);
-    if (n.branches && n.branches.length){
-      n.branches.forEach(b => walkAll(b.steps, depth+1, cb));
-    }
-    if (n.children && n.children.length){
-      walkAll(n.children, depth, cb);
-    }
-  }
-}
-
 /* ----------------------- Rendering: top strip ----------------------- */
 function renderAll(){
   renderTxnStrip();
@@ -910,29 +952,166 @@ function renderFlow(){
 }
 
 /* ----------------------- Rendering: table ----------------------- */
+/* ----------------------- Rendering: table (generic, metadata-driven) ----------------------- */
+function nodeLabel(id){
+  const info = NODE_INFO[id];
+  if (info){
+    const label = info.stepName || info.displayName || 'Step';
+    const sub = info.actionName ? `${info.displayName} · ${info.actionName}` : (info.displayName || '');
+    return { label, sub };
+  }
+  const s = findStepById(id);
+  if (s){
+    const sub = s.actionName ? `${s.displayName} · ${s.actionName}` : (s.displayName || '');
+    return { label: s.displayName || 'Step', sub };
+  }
+  return { label: 'Step', sub: '' };
+}
+
+// For a Fork-Join, group its runtime children into the routes defined in
+// componentStructure so the table can label them "Route 1" / "Route 2" etc.
+// Falls back to null (flat, ungrouped) if no static branch definition is found.
+function groupForkChildrenByRoute(forkStepId, childStepIds){
+  const forkNode = STEP_INDEX.find(s => s.id === forkStepId);
+  if (!forkNode || !forkNode.branches || !forkNode.branches.length) return null;
+  const childSet = new Set(childStepIds);
+  const groups = forkNode.branches.map((branch, idx) => ({
+    label: `Route ${idx+1}`,
+    stepIds: branch.steps.map(s => s.id),
+  }));
+  // Any runtime children that ran outside the statically-defined routes (rare) get
+  // surfaced too, so nothing observed at runtime is ever silently dropped.
+  const accounted = new Set(groups.flatMap(g => g.stepIds));
+  const leftover = childStepIds.filter(id => !accounted.has(id));
+  if (leftover.length) groups.push({ label: null, stepIds: leftover });
+  return groups;
+}
+
+function aggregateRouteAudit(stepIds){
+  const audits = stepIds.map(id => stepAudit(id));
+  const starts = audits.map(a=>a.startMs).filter(v=>v!==null);
+  const ends   = audits.map(a=>a.endMs).filter(v=>v!==null);
+  const startMs = starts.length ? Math.min(...starts) : null;
+  const endMs   = ends.length ? Math.max(...ends) : null;
+  let status;
+  if (audits.some(a => a.status === 'ERROR')) status = 'ERROR';
+  else if (audits.every(a => a.status === 'PENDING')) status = 'PENDING';
+  else if (audits.every(a => a.status === 'SUCCESS')) status = 'SUCCESS';
+  else status = 'RUNNING';
+  return {
+    status, startMs, endMs,
+    durationMs: (startMs!==null && endMs!==null) ? (endMs-startMs) : null,
+    iteration: 0, recs: audits.some(a=>a.recs.length) ? [1] : [],
+  };
+}
+
+function routeSummary(stepIds){
+  return stepIds.map(id => nodeLabel(id).label).join(' → ');
+}
+
+const EXPANDED_ROUTES = new Set();
+
+// Recursively builds the flat row list for rendering, walking the runtime
+// parent/child graph derived from the audit metadata (CHILDREN_BY_PARENT).
+// This naturally covers arbitrarily deep, dynamically-discovered sub-flows
+// (Service/Operations internals, If-else, Try/Catch, ...) with no special
+// casing, since it never depends on componentStructure being complete.
+function buildTableRows(stepIds, depth, rows, forceAll=false){
+  for (const stepId of stepIds){
+    const info = NODE_INFO[stepId] || {};
+    const audit = stepAudit(stepId);
+    const kids = CHILDREN_BY_PARENT[stepId] || [];
+    const isForkJoin = info.componentName === 'ForkJoin';
+    const routes = isForkJoin ? groupForkChildrenByRoute(stepId, kids) : null;
+
+    if (routes && routes.length){
+      const expanded = forceAll || EXPANDED_FORKS.has(stepId);
+      rows.push({ kind:'step', stepId, info, audit, depth, hasChildren:true, expanded, childCount: routes.length });
+      if (expanded){
+        routes.forEach((route, idx) => {
+          const routeKey = `${stepId}::${idx}`;
+          const routeExpanded = forceAll || EXPANDED_ROUTES.has(routeKey);
+          const routeAudit = aggregateRouteAudit(route.stepIds);
+          rows.push({ kind:'route', routeKey, idx, label: route.label || `Group ${idx+1}`, stepIds: route.stepIds, depth: depth+1, expanded: routeExpanded, audit: routeAudit });
+          if (routeExpanded) buildTableRows(route.stepIds, depth+2, rows, forceAll);
+        });
+      }
+    } else {
+      const hasChildren = kids.length > 0;
+      const expanded = hasChildren && (forceAll || EXPANDED_FORKS.has(stepId));
+      rows.push({ kind:'step', stepId, info, audit, depth, hasChildren, expanded, childCount: kids.length });
+      if (hasChildren && expanded) buildTableRows(kids, depth+1, rows, forceAll);
+    }
+  }
+}
+
 function renderTable(){
   const tbody = $('#tbody');
-  const rows = [];
-  walkAll(STEP_INDEX, 0, (step, depth) => {
-    const audit = stepAudit(step.id);
-    rows.push({ step, audit, depth });
-  });
 
   const draw = (filter='') => {
+    const rows = [];
+    const roots = CHILDREN_BY_PARENT[''] || [];
     const f = filter.trim().toLowerCase();
-    tbody.innerHTML = rows.filter(r => {
+    buildTableRows(roots, 0, rows, !!f);
+
+    const filtered = rows.filter(r => {
       if (!f) return true;
-      const hay = `${r.step.displayName} ${r.step.actionName||''} ${r.audit.status} ${r.audit.stepName||''}`.toLowerCase();
+      if (r.kind === 'route') return `${r.label} ${routeSummary(r.stepIds)}`.toLowerCase().includes(f);
+      const hay = `${r.info.displayName||''} ${r.info.actionName||''} ${r.audit.status} ${r.info.stepName||''}`.toLowerCase();
       return hay.includes(f);
-    }).map(r => {
-      const style = compStyle(r.step.componentName);
+    });
+
+    if (!rows.length){
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; color:var(--text-faint); padding:26px;">No executed steps recorded in this bundle yet.</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = filtered.map(r => {
       const indent = r.depth * 18;
-      const label = r.audit.stepName || r.step.displayName;
+
+      if (r.kind === 'route'){
+        return `
+        <tr data-route="${r.routeKey}" class="route-row">
+          <td class="td-step" style="padding-left:${16+indent}px">
+            <div class="td-step-inner">
+              <div class="row-toggle" data-toggle-route="${r.routeKey}" title="${r.expanded?'Collapse':'Expand'}">
+                <svg viewBox="0 0 24 24" fill="none">${r.expanded
+                  ? '<path d="M6 12h12" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>'
+                  : '<path d="M12 6v12M6 12h12" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>'}</svg>
+              </div>
+              <div class="td-step-text">
+                <div class="stepname route-label">${escapeHtml(r.label)}</div>
+                <div class="comp">${escapeHtml(routeSummary(r.stepIds))}</div>
+              </div>
+            </div>
+          </td>
+          <td class="td-time">${fmtTs(r.audit.startMs)}</td>
+          <td class="td-time">${fmtTs(r.audit.endMs)}</td>
+          <td class="td-time">${fmtDuration(r.audit.durationMs)}</td>
+          <td class="td-iter">—</td>
+          <td>${statusPillHtml(r.audit.status)}</td>
+          <td class="chev"></td>
+        </tr>`;
+      }
+
+      const { label, sub } = nodeLabel(r.stepId);
+      const labelWithCount = r.hasChildren ? `${escapeHtml(label)} <span class="route-count">(${r.childCount})</span>` : escapeHtml(label);
+      const toggleHtml = r.hasChildren ? `
+              <div class="row-toggle" data-toggle-fork-row="${r.stepId}" title="${r.expanded?'Collapse':'Expand'}">
+                <svg viewBox="0 0 24 24" fill="none">${r.expanded
+                  ? '<path d="M6 12h12" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>'
+                  : '<path d="M12 6v12M6 12h12" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>'}</svg>
+              </div>` : `<div class="row-toggle-spacer"></div>`;
       return `
-      <tr data-step="${r.step.id}">
+      <tr data-step="${r.stepId}">
         <td class="td-step" style="padding-left:${16+indent}px">
-          <div class="stepname">${escapeHtml(label)}</div>
-          <div class="comp">${escapeHtml(r.step.displayName)} · ${escapeHtml(r.step.actionName||r.step.componentName)}</div>
+          <div class="td-step-inner">
+            ${toggleHtml}
+            <div class="td-step-text">
+              <div class="stepname">${labelWithCount}</div>
+              <div class="comp">${escapeHtml(sub)}</div>
+            </div>
+          </div>
         </td>
         <td class="td-time">${fmtTs(r.audit.startMs)}</td>
         <td class="td-time">${fmtTs(r.audit.endMs)}</td>
@@ -943,7 +1122,22 @@ function renderTable(){
       </tr>`;
     }).join('') || `<tr><td colspan="7" style="text-align:center; color:var(--text-faint); padding:26px;">No steps match “${escapeHtml(filter)}”</td></tr>`;
 
-    $$('tr[data-step]', tbody).forEach(tr => tr.addEventListener('click', () => openDrawerFor(tr.dataset.step)));
+    $$('tr[data-step]', tbody).forEach(tr => tr.addEventListener('click', (e) => {
+      if (e.target.closest('[data-toggle-fork-row]')) return;
+      openDrawerFor(tr.dataset.step);
+    }));
+    $$('[data-toggle-fork-row]', tbody).forEach(btn => btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.toggleForkRow;
+      if (EXPANDED_FORKS.has(id)) EXPANDED_FORKS.delete(id); else EXPANDED_FORKS.add(id);
+      renderFlow();
+      draw(f);
+    }));
+    $$('tr.route-row', tbody).forEach(tr => tr.addEventListener('click', () => {
+      const key = tr.dataset.route;
+      if (EXPANDED_ROUTES.has(key)) EXPANDED_ROUTES.delete(key); else EXPANDED_ROUTES.add(key);
+      draw(f);
+    }));
   };
   draw();
   $('#searchBox').oninput = e => draw(e.target.value);
@@ -963,8 +1157,21 @@ function findStepById(id, list=STEP_INDEX){
   return null;
 }
 
+// Metadata (NODE_INFO) is the primary, comprehensive source for any step that has
+// executed — including deep dynamically-discovered sub-flows that never appear in
+// componentStructure. componentStructure (STEP_INDEX) is only needed as a fallback
+// for nodes clicked from the flow diagram that never ran (e.g. a not-yet-executed
+// Fork-Join branch), which therefore have no metadata at all.
+function getStepDisplayInfo(stepId){
+  const info = NODE_INFO[stepId];
+  if (info) return { displayName: info.displayName, componentName: info.componentName, actionName: info.actionName, stepName: info.stepName };
+  const s = findStepById(stepId);
+  if (s) return { displayName: s.displayName, componentName: s.componentName, actionName: s.actionName, stepName: null };
+  return { displayName: 'Step', componentName: 'Default', actionName: null, stepName: null };
+}
+
 async function openDrawerFor(stepId){
-  const step = findStepById(stepId);
+  const step = getStepDisplayInfo(stepId);
   if (!step) return;
   const audit = stepAudit(stepId);
   CURRENT_STEP = { step, audit };
@@ -975,7 +1182,7 @@ async function openDrawerFor(stepId){
   const style = compStyle(step.componentName);
   $('#drawerBadge').style.background = style.bg;
   $('#drawerBadge').textContent = style.code;
-  $('#drawerTitle').textContent = audit.stepName || step.displayName;
+  $('#drawerTitle').textContent = audit.stepName || step.stepName || step.displayName;
   $('#drawerMeta').textContent = `${step.displayName} · ${step.actionName || step.componentName}`;
 
   $('#drawerMetaStrip').innerHTML = `
