@@ -292,6 +292,11 @@ button{font-family:var(--sans);}
 .route-tag::before{content:''; position:absolute; left:-26px; top:50%; width:24px; height:2px; background:var(--wire);}
 .route-steps{display:flex; align-items:center; gap:0;}
 
+.subflow{
+  margin-top:14px; padding:16px; border:1px solid var(--line); border-radius:10px;
+  background:var(--panel-2); display:flex; align-items:flex-start; gap:0; min-width:max-content;
+}
+
 @media (prefers-reduced-motion: reduce){
   .wire-glow{animation:none; width:100%;}
 }
@@ -566,6 +571,18 @@ let TXN_META = {};         // summary info about the transaction
 let CURRENT_STEP = null;
 let NODE_INFO = {};          // stepId -> {displayName, componentName, actionName, stepName, parentConfigId} (metadata-driven)
 let CHILDREN_BY_PARENT = {}; // parentConfigId ('' for root) -> [stepId,...] in chronological order (metadata-driven)
+let IS_MCP_TRIGGER = false;  // when the flow's trigger is an MCP Server, "Operations"/"Status" are relabeled "Tools"/"Tool Output" to match Fusion Monitor's own presentation
+
+// Fusion Monitor renames the generic "Operations" / "Status" building blocks
+// to "Tools" / "Tool Output" whenever the flow is triggered by an MCP Server
+// (the underlying componentName/displayName in the data is identical either
+// way — this is purely a presentation-layer relabel, not a different component).
+function relabelForTrigger(displayName, componentName){
+  if (!IS_MCP_TRIGGER) return displayName;
+  if (componentName === 'Operations') return 'Tools';
+  if (componentName === 'Status') return 'Tool Output';
+  return displayName;
+}
 
 /* ----------------------- DOM refs ----------------------- */
 const $ = (sel, root=document) => root.querySelector(sel);
@@ -716,6 +733,7 @@ async function parseBundle(){
   }
 
   STEP_INDEX = structure.map(buildStepNode);
+  IS_MCP_TRIGGER = STEP_INDEX.length > 0 && STEP_INDEX[0].componentName === 'MCPServer';
 
   // Transaction-level summary derived from whatever records exist
   const allRecs = Object.values(RECORDS_BY_STEP).flat().sort((a,b)=>a._seq-b._seq);
@@ -878,9 +896,10 @@ function renderTxnStrip(){
 /* ----------------------- Rendering: flow diagram ----------------------- */
 function compStyle(name){ return COMPONENT_STYLE[name] || COMPONENT_STYLE.Default; }
 
-function nodeHtml(step){
-  const audit = stepAudit(step.id);
-  const style = compStyle(step.componentName);
+function nodeHtml(stepId){
+  const audit = stepAudit(stepId);
+  const info = getStepDisplayInfo(stepId);
+  const style = compStyle(info.componentName);
   const statusCls = { SUCCESS:'ok', RUNNING:'warn', ERROR:'err', PENDING:'idle' }[audit.status];
   const icon = {
     ok:'<svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="#04211d" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
@@ -890,59 +909,94 @@ function nodeHtml(step){
   }[statusCls];
   const timeLbl = audit.startMs ? fmtTs(audit.startMs).split(' ')[1] : (audit.status==='PENDING' ? 'not run' : '—');
   return `
-  <div class="node ${audit.status==='PENDING'?'pending':''}" data-step="${step.id}" tabindex="0">
+  <div class="node ${audit.status==='PENDING'?'pending':''}" data-step="${stepId}" tabindex="0">
     <div class="node-status ${statusCls}">${icon}</div>
     <div class="node-top">
       <div class="badge" style="background:${style.bg}">${style.code}</div>
       <div>
-        <div class="node-name">${escapeHtml(step.displayName)}</div>
-        <div class="node-action">${escapeHtml(step.actionName||step.componentName)}</div>
+        <div class="node-name">${escapeHtml(info.displayName)}</div>
+        <div class="node-action">${escapeHtml(info.actionName || relabelForTrigger(info.componentName, info.componentName))}</div>
       </div>
     </div>
     <div class="node-time">${timeLbl}</div>
   </div>`;
 }
 
-const EXPANDED_FORKS = new Set();
+const EXPANDED_FORKS = new Set(); // generic "expanded in the diagram" set, keyed by stepId at any depth
 
-function forkzoneHtml(node){
-  return node.branches.map((branch, idx) => {
-    const stepsHtml = branch.steps.map((s,i) => {
-      let h = `<div class="node-col">${nodeHtml(s)}</div>`;
-      if (i < branch.steps.length-1) h += `<div class="wire wire-fixed"></div>`;
-      return h;
+// What a node's children look like when the diagram expands it one level.
+// Fork-Join gets parallel "Route" lanes (using the static branch definitions,
+// same as the table, so routes preview even before/without execution);
+// everything else gets a plain sequential sub-chain of its real runtime
+// children. Returns null if the node has nothing to show.
+function diagramChildren(stepId){
+  const info = NODE_INFO[stepId];
+  const kids = CHILDREN_BY_PARENT[stepId] || [];
+  const isForkJoin = info && info.componentName === 'ForkJoin';
+  if (isForkJoin){
+    const routes = groupForkChildrenByRoute(stepId, kids);
+    return (routes && routes.length) ? { type:'routes', routes } : null;
+  }
+  return kids.length ? { type:'chain', stepIds: kids } : null;
+}
+
+function wireHtml(precedingStepId){
+  const doneCls = stepAudit(precedingStepId).status === 'SUCCESS' ? 'done' : '';
+  return `<div class="wire wire-fixed ${doneCls}">${doneCls ? '<span class="wire-glow"></span>' : ''}</div>`;
+}
+
+const MAX_DIAGRAM_DEPTH = 12; // safety cap; real flows never get remotely this deep
+
+function nodeColHtml(stepId, depth){
+  const children = depth < MAX_DIAGRAM_DEPTH ? diagramChildren(stepId) : null;
+  let html = nodeHtml(stepId);
+  if (children){
+    const expanded = EXPANDED_FORKS.has(stepId);
+    const count = children.type === 'routes' ? children.routes.length : children.stepIds.length;
+    html += `
+      <div class="node-expand-stem"></div>
+      <div class="node-expand" data-toggle-fork="${stepId}" title="${expanded?'Collapse':'Expand'} ${count}">
+        <svg viewBox="0 0 24 24" fill="none">${expanded
+          ? '<path d="M6 12h12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>'
+          : '<path d="M12 6v12M6 12h12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>'}</svg>
+      </div>`;
+    if (expanded) html += subflowHtml(children, depth);
+  }
+  return `<div class="node-col">${html}</div>`;
+}
+
+function subflowHtml(children, depth){
+  if (children.type === 'routes'){
+    const routesHtml = children.routes.map((route, idx) => {
+      const stepsHtml = route.stepIds.map((id,i) => {
+        let h = nodeColHtml(id, depth+1);
+        if (i < route.stepIds.length-1) h += wireHtml(id);
+        return h;
+      }).join('');
+      return `<div class="route"><div class="route-tag">${route.label || `Group ${idx+1}`}</div><div class="route-steps">${stepsHtml}</div></div>`;
     }).join('');
-    return `<div class="route"><div class="route-tag">Route ${idx+1}</div><div class="route-steps">${stepsHtml}</div></div>`;
+    return `<div class="forkzone">${routesHtml}</div>`;
+  }
+  const stepsHtml = children.stepIds.map((id,i) => {
+    let h = nodeColHtml(id, depth+1);
+    if (i < children.stepIds.length-1) h += wireHtml(id);
+    return h;
   }).join('');
+  return `<div class="subflow">${stepsHtml}</div>`;
 }
 
 function renderFlow(){
   const wrap = $('#flowMain');
   let html = '';
   STEP_INDEX.forEach((step, i) => {
-    const hasFork = step.branches && step.branches.length;
-    const expanded = hasFork && EXPANDED_FORKS.has(step.id);
-    let colHtml = nodeHtml(step);
-    if (hasFork){
-      colHtml += `
-        <div class="node-expand-stem"></div>
-        <div class="node-expand" data-toggle-fork="${step.id}" title="${expanded?'Collapse':'Expand'} ${step.branches.length} routes">
-          <svg viewBox="0 0 24 24" fill="none">${expanded
-            ? '<path d="M6 12h12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>'
-            : '<path d="M12 6v12M6 12h12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>'}</svg>
-        </div>`;
-      if (expanded) colHtml += `<div class="forkzone">${forkzoneHtml(step)}</div>`;
-    }
-    html += `<div class="node-col">${colHtml}</div>`;
-    if (i < STEP_INDEX.length-1){
-      const doneCls = stepAudit(step.id).status === 'SUCCESS' ? 'done' : '';
-      html += `<div class="wire wire-fixed ${doneCls}">${doneCls ? '<span class="wire-glow"></span>' : ''}</div>`;
-    }
+    html += nodeColHtml(step.id, 0);
+    if (i < STEP_INDEX.length-1) html += wireHtml(step.id);
   });
   wrap.innerHTML = html;
 
-  // click handlers
-  $$('.node', wrap).forEach(n => n.addEventListener('click', () => openDrawerFor(n.dataset.step)));
+  // Diagram nodes only ever toggle inline expansion — they never open the
+  // drawer. The Step Audit Trail table is the sole place for inspecting a
+  // step's input/output payloads.
   $$('[data-toggle-fork]', wrap).forEach(btn => btn.addEventListener('click', (e) => {
     e.stopPropagation();
     const id = btn.dataset.toggleFork;
@@ -956,14 +1010,16 @@ function renderFlow(){
 function nodeLabel(id){
   const info = NODE_INFO[id];
   if (info){
-    const label = info.stepName || info.displayName || 'Step';
-    const sub = info.actionName ? `${info.displayName} · ${info.actionName}` : (info.displayName || '');
+    const dn = relabelForTrigger(info.displayName, info.componentName);
+    const label = info.stepName || dn || 'Step';
+    const sub = info.actionName ? `${dn} · ${info.actionName}` : (dn || '');
     return { label, sub };
   }
   const s = findStepById(id);
   if (s){
-    const sub = s.actionName ? `${s.displayName} · ${s.actionName}` : (s.displayName || '');
-    return { label: s.displayName || 'Step', sub };
+    const dn = relabelForTrigger(s.displayName, s.componentName);
+    const sub = s.actionName ? `${dn} · ${s.actionName}` : (dn || '');
+    return { label: dn || 'Step', sub };
   }
   return { label: 'Step', sub: '' };
 }
@@ -1164,9 +1220,9 @@ function findStepById(id, list=STEP_INDEX){
 // Fork-Join branch), which therefore have no metadata at all.
 function getStepDisplayInfo(stepId){
   const info = NODE_INFO[stepId];
-  if (info) return { displayName: info.displayName, componentName: info.componentName, actionName: info.actionName, stepName: info.stepName };
+  if (info) return { displayName: relabelForTrigger(info.displayName, info.componentName), componentName: info.componentName, actionName: info.actionName, stepName: info.stepName };
   const s = findStepById(stepId);
-  if (s) return { displayName: s.displayName, componentName: s.componentName, actionName: s.actionName, stepName: null };
+  if (s) return { displayName: relabelForTrigger(s.displayName, s.componentName), componentName: s.componentName, actionName: s.actionName, stepName: null };
   return { displayName: 'Step', componentName: 'Default', actionName: null, stepName: null };
 }
 
@@ -1183,7 +1239,7 @@ async function openDrawerFor(stepId){
   $('#drawerBadge').style.background = style.bg;
   $('#drawerBadge').textContent = style.code;
   $('#drawerTitle').textContent = audit.stepName || step.stepName || step.displayName;
-  $('#drawerMeta').textContent = `${step.displayName} · ${step.actionName || step.componentName}`;
+  $('#drawerMeta').textContent = step.actionName ? `${step.displayName} · ${step.actionName}` : step.displayName;
 
   $('#drawerMetaStrip').innerHTML = `
     <div class="txn-field"><span class="lbl">Status</span>${statusPillHtml(audit.status)}</div>
