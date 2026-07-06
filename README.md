@@ -4,4 +4,5 @@ A web app to view Amplify Fusion [transaction data](https://github.com/lbrenman/
 
 Import the transaction zip file and click on the audit steps to view payload data.
 
-![image](images/main.png)
+![image](images/main1.png)
+![image](images/main2.png)
