@@ -450,7 +450,7 @@ tr.route-row:hover{background:var(--panel-2);}
 
 <div id="landing" class="landing">
   <h1>Replay any exported <span>transaction bundle</span> — fully offline.</h1>
-  <p class="lead">Drop in the zip an iPaaS transaction export produces and step through every audit checkpoint: the trigger event, each component's audit trail, and the exact input and output payload captured at each step.</p>
+  <p class="lead">Drop in the Fusion transaction zip file and step through every audit checkpoint: the trigger event, each component's audit trail, and the exact input and output payload captured at each step.</p>
 
   <div class="dropzone" id="dropzone">
     <svg class="dz-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -461,12 +461,6 @@ tr.route-row:hover{background:var(--panel-2);}
     <p>Reads <span style="color:var(--text-dim); font-family:var(--mono);">event/componentStructure</span> + <span style="color:var(--text-dim); font-family:var(--mono);">event/stepAuditsMetadata</span> and every step payload — nothing leaves your browser.</p>
     <input type="file" id="fileInput" accept=".zip">
     <div class="dz-error" id="dzError"></div>
-  </div>
-
-  <div class="spec-list">
-    <div class="spec"><div class="k">01 · Flow</div><div class="v">Renders the component chain in execution order, expanding Fork&#8209;Join routes as parallel lanes.</div></div>
-    <div class="spec"><div class="k">02 · Audit</div><div class="v">Groups every STARTED / TRIGGERED / COMPLETED record per step to derive status, duration, and payload refs.</div></div>
-    <div class="spec"><div class="k">03 · Payloads</div><div class="v">Opens the input snapshot next to the output payload in a searchable, collapsible JSON tree.</div></div>
   </div>
 </div>
 
